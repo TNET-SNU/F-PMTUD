@@ -10,40 +10,38 @@
 #include <netinet/udp.h>
 #include <netinet/ether.h>
 #include <linux/if_packet.h>
-
-// 추가된 헤더들
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
 
 #define BUFFER_SIZE     65536
 #define MAX_TRACKED_IDS 100
-#define MAGIC_MARKER    "FPMT"  // 클라이언트에서 보낸 식별자 (4바이트)
-#define EXIT_MARKER     "FEXIT" // 종료 요청 식별자 (5바이트)
+#define MAGIC_MARKER    "FPMT"  // Identifier sent by client (4 bytes)
+#define EXIT_MARKER     "FEXIT" // Shutdown request identifier (5 bytes)
 
-// 단편 추적 구조체
+// Fragment tracking structure
 typedef struct {
-    uint16_t ip_id;                // IP 식별자
-    int      received_payload_len; // 누적 UDP 데이터 길이
-    int      expected_payload_len; // 전체 UDP 데이터 길이(첫 단편에서 파악)
-    int      max_ip_len;           // 단편들 중 최대 IP 패킷 길이
-    bool     complete;             // 모든 단편 수신 완료 여부
+    uint16_t ip_id;                // IP identification field
+    int      received_payload_len; // Accumulated UDP data length
+    int      expected_payload_len; // Total UDP data length (determined from first fragment)
+    int      max_ip_len;           // Maximum IP packet length among fragments
+    bool     complete;             // Flag indicating all fragments received
 } PacketState;
 
-// 전역/정적 변수
+// Global/static variables
 static PacketState packet_states[MAX_TRACKED_IDS];
 static size_t      num_tracked_ids  = 0;
 static bool        exit_requested   = false;
 static bool        port_bound       = false;
 
-// 최종 성공 여부 플래그 (하나라도 정상 응답 전송에 성공하면 1)
+// Flag indicating overall success (set to 1 if any response is sent successfully)
 static int overall_success = 0;
 
 // -------------------------
-// 추가: 인터페이스 MTU 설정에 필요한 함수들
+// Functions for interface MTU configuration
 // -------------------------
 
-// "lo" 제외, 첫 번째 IPv4 인터페이스 이름 얻기
+// Retrieve the first non-loopback IPv4 interface name
 static int get_first_nonlo_interface(char *if_name_out, size_t size) {
     struct ifaddrs *ifaddr, *ifa;
     if (getifaddrs(&ifaddr) != 0) {
@@ -67,7 +65,7 @@ static int get_first_nonlo_interface(char *if_name_out, size_t size) {
     return found ? 0 : -1;
 }
 
-// 인터페이스 MTU 설정 시도
+// Attempt to set MTU on given interface
 static int try_set_mtu(const char *ifname, int mtu_val) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "sudo ip link set dev %s mtu %d 2>&1", ifname, mtu_val);
@@ -80,6 +78,7 @@ static int try_set_mtu(const char *ifname, int mtu_val) {
     int success = 1;
     char line[256];
     while (fgets(line, sizeof(line), fp)) {
+        // Check for device MTU maximum error
         if (strstr(line, "Error: mtu greater than device maximum.")) {
             success = 0;
         }
@@ -89,24 +88,24 @@ static int try_set_mtu(const char *ifname, int mtu_val) {
 }
 
 // -------------------------
-// 나머지 기존 함수들
+// Remaining core functions
 // -------------------------
 
 /*
- * 만약 아직 bind가 되지 않은 상태에서, 분할된 패킷이나 FPMT 마커가 포함된 패킷을 수신하면,
- * 해당 UDP 목적지 포트로 bind를 시도함.
- * 만약 bind()가 실패하면 에러 메시지만 출력하고 계속 진행.
+ * If socket isn't bound yet and a packet with fragments or the magic marker arrives,
+ * attempt to bind the UDP socket to the destination port.
+ * On failure, log error but continue processing.
  */
 static void maybe_bind_udp_socket(int udp_sock, uint16_t dest_port)
 {
     if (port_bound)
-        return; // 이미 bind됨
+        return; // Already bound
 
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family      = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;  // 모든 인터페이스
-    server_addr.sin_port        = dest_port;   // network byte order 그대로
+    server_addr.sin_addr.s_addr = INADDR_ANY;  // Bind on all interfaces
+    server_addr.sin_port        = dest_port;   // Network byte order
 
     if (bind(udp_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         if (errno == EADDRINUSE) {
@@ -115,13 +114,14 @@ static void maybe_bind_udp_socket(int udp_sock, uint16_t dest_port)
             perror("[mtud_destination] UDP bind failed");
             fprintf(stderr, "[mtud_destination] Failed to bind port %u. Ignoring and continuing.\n", ntohs(dest_port));
         }
-        return;  // bind되지 않았더라도 종료시키지 않고 계속 진행
+        return;  // Proceed even if bind failed
     }
 
     port_bound = true;
     fprintf(stderr, "[mtud_destination] Dynamically bound destination UDP socket to port %u\n", ntohs(dest_port));
 }
 
+// Find tracking index by IP ID
 static int find_packet_state(uint16_t ip_id)
 {
     for (size_t i = 0; i < num_tracked_ids; i++) {
@@ -132,6 +132,7 @@ static int find_packet_state(uint16_t ip_id)
     return -1;
 }
 
+// Remove the oldest tracked state when exceeding limit
 static void remove_oldest_packet_state()
 {
     if (num_tracked_ids == 0)
@@ -142,6 +143,7 @@ static void remove_oldest_packet_state()
     num_tracked_ids--;
 }
 
+// Add new tracked state for IP ID
 static int add_packet_state(uint16_t ip_id)
 {
     if (num_tracked_ids >= MAX_TRACKED_IDS) {
@@ -158,7 +160,7 @@ static int add_packet_state(uint16_t ip_id)
     return num_tracked_ids++;
 }
 
-// PMTUD 패킷 여부
+// Check if packet is a PMTUD probe (non-fragmented)
 static bool is_pmtud_packet(const char *payload, int payload_len)
 {
     if (payload_len < 4)
@@ -166,7 +168,7 @@ static bool is_pmtud_packet(const char *payload, int payload_len)
     return (memcmp(payload, MAGIC_MARKER, 4) == 0);
 }
 
-// 종료 요청 패킷 여부
+// Check if packet is an exit request
 static bool is_exit_packet(const char *payload, int payload_len)
 {
     if (payload_len < 5)
@@ -175,19 +177,20 @@ static bool is_exit_packet(const char *payload, int payload_len)
 }
 
 /*
- * 수신한 RAW 패킷 처리 함수
+ * Process each received raw packet, extract UDP fragments or probes,
+ * track reassembly state, and send responses when complete.
  */
 static void process_packet(char *buffer, ssize_t data_len, int udp_sock, struct sockaddr_in *client_addr)
 {
-    // 이더넷 헤더
+    // Parse Ethernet header
     struct ethhdr *ethh = (struct ethhdr *)buffer;
     if (ntohs(ethh->h_proto) != ETH_P_IP)
-        return; // IP 패킷이 아니면 무시
+        return; // Ignore non-IP packets
 
-    // IP 헤더
+    // Parse IP header
     struct iphdr *iph = (struct iphdr *)(ethh + 1);
     if (iph->protocol != IPPROTO_UDP)
-        return;  // UDP 패킷만 처리
+        return;  // Only handle UDP
 
     int ip_hdr_len = iph->ihl << 2;
     int ip_tot_len = ntohs(iph->tot_len);
@@ -195,32 +198,32 @@ static void process_packet(char *buffer, ssize_t data_len, int udp_sock, struct 
     if (ip_payload_len < (int)sizeof(struct udphdr))
         return;
 
-    // UDP 헤더
+    // Parse UDP header
     struct udphdr *udph = (struct udphdr *)((char *)iph + ip_hdr_len);
     int udp_total_len = ntohs(udph->len);
     int udp_data_len  = udp_total_len - sizeof(struct udphdr);
     char *udp_payload = (char *)udph + sizeof(struct udphdr);
 
-    uint16_t client_source_port = udph->source;  // network order 그대로
+    uint16_t client_source_port = udph->source;  // Network order
 
-    // 종료 요청 패킷 체크
+    // Check for exit request
     if (is_exit_packet(udp_payload, udp_data_len)) {
         fprintf(stderr, "[mtud_destination] Exit packet received. Shutting down.\n");
         exit_requested = true;
         return;
     }
 
-    // 패킷의 분할 여부 확인
+    // Determine if packet is fragmented
     uint16_t ip_frag = ntohs(iph->frag_off);
     bool is_fragmented = ((ip_frag & 0x1FFF) != 0) || (ip_frag & 0x2000);
 
-    // 비분할인 경우: UDP payload의 처음 4바이트에 MAGIC_MARKER가 있어야 함
+    // For non-fragmented packets, require magic marker
     if (!is_fragmented) {
         if (udp_data_len < 4 || !is_pmtud_packet(udp_payload, udp_data_len))
-            return; // 마커 없으면 무시
+            return;
     }
-    // 분할된 패킷은 마커 유무와 관계없이 처리
 
+    // Bind UDP socket dynamically on first valid packet
     if (!port_bound)
         maybe_bind_udp_socket(udp_sock, udph->dest);
 
@@ -229,7 +232,7 @@ static void process_packet(char *buffer, ssize_t data_len, int udp_sock, struct 
 
     uint16_t ip_id = ntohs(iph->id);
 
-    // 비분할 패킷
+    // Non-fragmented case: respond immediately
     if (!is_fragmented) {
         fprintf(stderr, "[mtud_destination] Tracking new IP ID: %u (non-fragmented)\n", ip_id);
         client_addr->sin_family      = AF_INET;
@@ -237,16 +240,16 @@ static void process_packet(char *buffer, ssize_t data_len, int udp_sock, struct 
         client_addr->sin_addr.s_addr = iph->saddr;
         fprintf(stderr, "[mtud_destination] ID=%u, UDP length=%d\n", ip_id, udp_data_len + 8);
         fprintf(stderr, "[mtud_destination] Prober=%s:%d\n",
-                inet_ntoa(client_addr->sin_addr),
-                ntohs(client_addr->sin_port));
+                inet_ntoa(client_addr->sin_addr), ntohs(client_addr->sin_port));
+
         int net_val = htonl(ip_tot_len);
         sendto(udp_sock, &net_val, sizeof(net_val), 0,
                (struct sockaddr *)client_addr, sizeof(*client_addr));
-        overall_success = 1;  // 성공적인 응답 전송
+        overall_success = 1;
         return;
     }
 
-    // 분할된 패킷
+    // Fragmented packet handling
     int idx = find_packet_state(ip_id);
     if (idx == -1) {
         idx = add_packet_state(ip_id);
@@ -259,9 +262,9 @@ static void process_packet(char *buffer, ssize_t data_len, int udp_sock, struct 
 
     int this_data = 0;
     if ((ip_frag & 0x1FFF) == 0)
-        this_data = ip_payload_len - sizeof(struct udphdr); // 첫 단편: UDP 헤더 포함
+        this_data = ip_payload_len - sizeof(struct udphdr); // First fragment includes UDP header
     else
-        this_data = ip_payload_len; // 나머지 단편: 순수 payload
+        this_data = ip_payload_len; // Subsequent fragments carry only data
     st->received_payload_len += this_data;
 
     fprintf(stderr,
@@ -271,8 +274,8 @@ static void process_packet(char *buffer, ssize_t data_len, int udp_sock, struct 
             ip_tot_len,
             st->received_payload_len);
 
+    // On first fragment, record expected total UDP length and source info
     if (((ip_frag & 0x1FFF) == 0) && (st->expected_payload_len == 0)) {
-        // 첫 단편에서 전체 UDP 길이
         st->expected_payload_len = udp_data_len;
         client_addr->sin_family      = AF_INET;
         client_addr->sin_port        = client_source_port;
@@ -281,6 +284,7 @@ static void process_packet(char *buffer, ssize_t data_len, int udp_sock, struct 
                 ip_id, inet_ntoa(client_addr->sin_addr), ntohs(client_addr->sin_port));
     }
 
+    // When all fragments received, send response with largest packet size
     if (st->expected_payload_len > 0 &&
         st->received_payload_len >= st->expected_payload_len &&
         !st->complete) {
@@ -290,20 +294,20 @@ static void process_packet(char *buffer, ssize_t data_len, int udp_sock, struct 
         int net_val = htonl(st->max_ip_len);
         sendto(udp_sock, &net_val, sizeof(net_val), 0,
                (struct sockaddr *)client_addr, sizeof(*client_addr));
-        overall_success = 1;  // 성공적인 응답 전송
+        overall_success = 1;
     }
 }
 
 int main(void)
 {
     // -------------------------------
-    // (추가) 인터페이스 자동 탐색 + MTU 설정
+    // Auto-detect interface and attempt MTU configuration
     // -------------------------------
     char if_name[IFNAMSIZ] = {0};
     if (get_first_nonlo_interface(if_name, sizeof(if_name)) < 0) {
         fprintf(stderr, "[mtud_destination] No suitable non-lo interface found. Proceeding without MTU config.\n");
     } else {
-        // 64000->9000->1500->fallback=500
+        // Try MTUs: 64000, 9000, 1500, fallback to 500
         int tries[3] = {64000, 9000, 1500};
         int configured_mtu = 500;
         int set_ok = 0;
@@ -330,14 +334,14 @@ int main(void)
         }
     }
 
-    // RAW 소켓 생성 (패킷 분석용)
+    // Create raw socket for packet inspection
     int raw_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
     if (raw_sock < 0) {
         perror("[mtud_destination] socket(AF_PACKET, SOCK_RAW, ETH_P_IP)");
         return 1;
     }
 
-    // UDP 소켓 생성 (응답 전송용)
+    // Create UDP socket for sending responses
     int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_sock < 0) {
         perror("[mtud_destination] UDP socket creation failed");
@@ -358,7 +362,7 @@ int main(void)
     struct sockaddr_in client_addr;
     memset(&client_addr, 0, sizeof(client_addr));
 
-    // 메인 루프: RAW 소켓으로 IP 패킷 수신 → process_packet
+    // Main loop: receive raw packets and process them
     while (1) {
         ssize_t data_len = recv(raw_sock, buffer, BUFFER_SIZE, 0);
         if (data_len < 0) {
@@ -378,7 +382,7 @@ int main(void)
     close(raw_sock);
     close(udp_sock);
 
-    // 최종 결과 stdout
+    // Final result to stdout
     if (overall_success) {
         printf("F-PMTUD_destination SUCCESS");
     } else {

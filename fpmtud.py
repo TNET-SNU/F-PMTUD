@@ -12,7 +12,6 @@ tcp_port = 9999
 
 class Tee:
     def __init__(self, filename, stream):
-        # stream는 원래 출력 스트림(참고용)이나, 우리는 파일에만 기록한다.
         self.file = open(filename, 'a', encoding='utf-8')
     def write(self, data):
         self.file.write(data)
@@ -20,6 +19,7 @@ class Tee:
         self.file.flush()
     def close(self):
         self.file.close()
+
 
 def run_command(cmd, capture_output=True, shell=False):
     try:
@@ -33,9 +33,11 @@ def run_command(cmd, capture_output=True, shell=False):
     except subprocess.CalledProcessError as e:
         return e.stdout.strip() if e.stdout is not None else ""
 
+
 def run_sudo(cmd_list, capture_output=True):
     sudo_cmd = ["sudo"] + cmd_list
     return run_command(sudo_cmd, capture_output=capture_output)
+
 
 def extract_probe_info(output):
     m = re.search(r'Prober=([\d\.]+):(\d+)', output)
@@ -45,13 +47,14 @@ def extract_probe_info(output):
 
 ##############################
 # F-PMTUD related functions
+
 def run_fpmtd_prober(dest_ip):
     print("[F-PMTUD, prober] Starting mtud_prober with destination IP: " + dest_ip, file=sys.stderr)
     cmd = ["./mtud_prober", "-i", dest_ip, "-p", "9999"]
     return run_sudo(cmd, capture_output=True)
 
 def run_fpmtd_prober_with_probe(dest_ip, probe_port):
-    print("[F-PMTUD, destination] Starting mtud_prober with destination IP: {} and probe port: {}".format(dest_ip, probe_port), file=sys.stderr)
+    print(f"[F-PMTUD, destination] Starting mtud_prober with destination IP: {dest_ip} and probe port: {probe_port}", file=sys.stderr)
     cmd = ["./mtud_prober", "-i", dest_ip, "-p", probe_port, "-P", "9999"]
     return run_sudo(cmd, capture_output=True)
 
@@ -62,6 +65,7 @@ def run_fpmtd_destination():
 
 ##############################
 # MSS Clamping related functions
+
 def get_peer_mss(target_host, target_port):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -70,16 +74,16 @@ def get_peer_mss(target_host, target_port):
         sock.connect((target_host, target_port))
         print(f"Connected to {target_host}:{target_port}")
 
-        # Prober 측 소켓에서 확인한 MSS
+        # Check MSS from the prober side socket
         peer_mss = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG)
         print(f"Prober received MSS: {peer_mss} bytes")
 
-        # Daemon(서버)로부터도 MSS 안내를 받아 출력
+        # Receive MSS advertised by the daemon (server)
         received_data = sock.recv(1024).decode('utf-8')
         print(f"Received MSS from daemon: {received_data}")
 
     except socket.timeout:
-        print(f"Connection to {target_host}:{target_port} timed out after 5 seconds.")
+        print(f"Connection to {target_host}:{target_port} timed out after 10 seconds.")
         return False
     except socket.error as e:
         if isinstance(e, socket.error) and e.errno == errno.ECONNREFUSED:
@@ -98,13 +102,13 @@ def run_daemon(port):
 
         server_sock.bind(("0.0.0.0", port))
         server_sock.listen(30)
-        print(f"MSS Claping checker: Listening on port {port}...")
+        print(f"MSS Clamping checker: Listening on port {port}...")
 
         while True:
             client_sock, client_addr = server_sock.accept()
             print(f"Connection accepted from {client_addr}")
             try:
-                # 연결된 소켓에서 서버가 인지하는 MSS
+                # Obtain MSS observed by the server side socket
                 peer_mss = client_sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG)
                 msg = f"\nDaemon received MSS: {peer_mss} bytes"
                 client_sock.sendall(msg.encode('utf-8'))
@@ -122,10 +126,11 @@ def run_daemon(port):
         server_sock.close()
 
 ##############################
+
 def setup_output_filename(test_name, role):
     """
-    파일명 끝에 현재 날짜/시간(초 단위까지)을 추가.
-    예: F-PMTUD_destination_result_20250123235959.txt
+    Append current UTC timestamp (to the second) to the filename.
+    Example: F-PMTUD_destination_result_20250123235959.txt
     """
     now = datetime.datetime.utcnow()
     timestamp_str = now.strftime("%Y%m%d%H%M%S")
@@ -136,9 +141,10 @@ def run_prober_tests(dest_ip):
     original_stderr = sys.stderr
     sys.stderr = open(os.devnull, 'w')
     
-    # 2. MSS Clamping
+    # Clear route cache before MSS Clamping test
     run_sudo(["ip", "route", "flush", "cache"])
 
+    # MSS Clamping test
     filename = setup_output_filename("MSS", "prober")
     tee = Tee(filename, original_stdout)
     sys.stdout = tee
@@ -148,9 +154,10 @@ def run_prober_tests(dest_ip):
 
     mss_result = "SUCCESS" if mss_result is True else "FAILED"
 
-    # 1. F-PMTUD prober test
+    # Clear route cache before F-PMTUD prober test
     run_sudo(["ip", "route", "flush", "cache"])
 
+    # F-PMTUD prober test
     filename = setup_output_filename("F-PMTUD", "prober")
     tee = Tee(filename, original_stdout)
     sys.stdout = tee
@@ -178,11 +185,11 @@ def run_destination_tests():
     original_stderr = sys.stderr
     sys.stderr = open(os.devnull, 'w')
     
-    # 2. MSS clamping test
+    # Clear route cache before MSS Clamping daemon
     run_sudo(["ip", "route", "flush", "cache"])
     run_daemon(tcp_port)
 
-    # 1. F-PMTUD destination test
+    # Clear route cache before F-PMTUD destination test
     run_sudo(["ip", "route", "flush", "cache"])
 
     filename = setup_output_filename("F-PMTUD", "destination")
@@ -200,7 +207,7 @@ def run_destination_tests():
         sys.stderr.close()
         sys.stderr = original_stderr
         sys.exit(1)
-    print("\n[F-PMTUD, destination] Second phase: mtud_prober with -i {} -p {}\n".format(probe_ip, probe_port))
+    print(f"\n[F-PMTUD, destination] Second phase: mtud_prober with -i {probe_ip} -p {probe_port}\n")
     output2 = run_fpmtd_prober_with_probe(probe_ip, probe_port)
     print("===== mtud_prober (destination) Output =====")
     print(output2)
@@ -215,7 +222,7 @@ def run_destination_tests():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Integrated F-PMTUD, F-PMTUD_setDF, and MSS Clamping tests"
+        description="Integrated F-PMTUD, F-PMDUT_setDF, and MSS Clamping tests"
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("-p", "--prober", metavar="DEST_IP",
